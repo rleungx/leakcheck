@@ -27,7 +27,7 @@ func NewWithConfig(config *Config) *analysis.Analyzer {
 		Name:     "leakcheck",
 		Doc:      "check that all tests are covered by goleak",
 		Requires: []*analysis.Analyzer{inspect.Analyzer},
-		Run:      makeRun(config),
+		Run:      run(config),
 	}
 
 	// Add flags for command-line usage
@@ -40,8 +40,8 @@ func NewWithConfig(config *Config) *analysis.Analyzer {
 // Analyzer is the default analyzer instance for backward compatibility
 var Analyzer = New()
 
-// makeRun creates a run function with the given configuration
-func makeRun(config *Config) func(*analysis.Pass) (interface{}, error) {
+// run creates a run function with the given configuration
+func run(config *Config) func(*analysis.Pass) (interface{}, error) {
 	return func(pass *analysis.Pass) (interface{}, error) {
 		inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
@@ -55,17 +55,8 @@ func makeRun(config *Config) func(*analysis.Pass) (interface{}, error) {
 			return nil, nil
 		}
 
-		// Check all files for test files
-		hasTestFile := false
-		for _, file := range pass.Files {
-			filename := pass.Fset.Position(file.Pos()).Filename
-			if isTestFile(filename) && !shouldExcludeFile(filename, config) {
-				hasTestFile = true
-				break
-			}
-		}
-
-		if !hasTestFile {
+		// Check if we have any non-excluded test files
+		if !hasNonExcludedTestFiles(pass, config) {
 			return nil, nil
 		}
 
@@ -76,16 +67,9 @@ func makeRun(config *Config) func(*analysis.Pass) (interface{}, error) {
 			funcsCoveredByDefer map[string]bool = make(map[string]bool)
 		)
 
-		// Look for imports to check if goleak is imported
-		hasGoleakImport := false
-		for _, file := range pass.Files {
-			for _, imp := range file.Imports {
-				if imp.Path != nil && (imp.Path.Value == `"go.uber.org/goleak"` || imp.Path.Value == `"github.com/uber-go/goleak"`) {
-					hasGoleakImport = true
-					break
-				}
-			}
-		}
+		// Check if goleak is imported and get its alias
+		goleakAlias := getGoleakAlias(pass.Files)
+		hasGoleakImport := goleakAlias != ""
 
 		// If no goleak import, report for all test functions
 		if !hasGoleakImport {
@@ -112,7 +96,7 @@ func makeRun(config *Config) func(*analysis.Pass) (interface{}, error) {
 				ast.Inspect(fd, func(node ast.Node) bool {
 					if call, ok := node.(*ast.CallExpr); ok {
 						if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-							if isGoleakCall(sel, "VerifyTestMain") {
+							if isGoleakCall(sel, "VerifyTestMain", goleakAlias) {
 								hasVerifyTestMain = true
 							}
 						}
@@ -126,7 +110,7 @@ func makeRun(config *Config) func(*analysis.Pass) (interface{}, error) {
 				ast.Inspect(fd, func(node ast.Node) bool {
 					if defer_stmt, ok := node.(*ast.DeferStmt); ok {
 						if call, ok := defer_stmt.Call.Fun.(*ast.SelectorExpr); ok {
-							if isGoleakCall(call, "VerifyNone") {
+							if isGoleakCall(call, "VerifyNone", goleakAlias) {
 								funcsCoveredByDefer[fd.Name.Name] = true
 							}
 						}
@@ -178,45 +162,76 @@ func isTestFunction(name string) bool {
 }
 
 // isGoleakCall checks if a selector expression is a call to goleak with the specified method
-func isGoleakCall(sel *ast.SelectorExpr, method string) bool {
+func isGoleakCall(sel *ast.SelectorExpr, method, alias string) bool {
 	if sel.Sel.Name != method {
 		return false
 	}
 
 	if ident, ok := sel.X.(*ast.Ident); ok {
-		return ident.Name == "goleak"
+		return ident.Name == alias
 	}
 
 	return false
 }
 
+// GetGoleakAlias checks if any file imports goleak and returns its alias/name (exported for testing)
+func GetGoleakAlias(files []*ast.File) string {
+	return getGoleakAlias(files)
+}
+
+// getGoleakAlias checks if any file imports goleak and returns its alias/name
+func getGoleakAlias(files []*ast.File) string {
+	for _, file := range files {
+		for _, imp := range file.Imports {
+			if imp.Path != nil && (imp.Path.Value == `"go.uber.org/goleak"` || imp.Path.Value == `"github.com/uber-go/goleak"`) {
+				if imp.Name != nil {
+					// Has explicit alias
+					return imp.Name.Name
+				}
+				// Default import name
+				return "goleak"
+			}
+		}
+	}
+	return ""
+}
+
 // shouldExcludePackage checks if a package should be excluded based on patterns
 func shouldExcludePackage(pkgPath string, config *Config) bool {
-	if config.ExcludePackages == "" {
+	return matchesAnyPattern(pkgPath, config.ExcludePackages)
+}
+
+// shouldExcludeFile checks if a file should be excluded based on patterns
+func shouldExcludeFile(filename string, config *Config) bool {
+	return matchesAnyPattern(filename, config.ExcludeFiles)
+}
+
+// matchesAnyPattern checks if a string matches any of the comma-separated patterns
+func matchesAnyPattern(str, patterns string) bool {
+	if patterns == "" {
 		return false
 	}
 
-	patterns := strings.Split(config.ExcludePackages, ",")
-	for _, pattern := range patterns {
+	for _, pattern := range strings.Split(patterns, ",") {
 		pattern = strings.TrimSpace(pattern)
 		if pattern == "" {
 			continue
 		}
 
 		// Try exact match first
-		if pkgPath == pattern {
+		if str == pattern || strings.HasSuffix(str, pattern) {
 			return true
 		}
 
 		// Try regex match
-		if matched, err := regexp.MatchString(pattern, pkgPath); err == nil && matched {
+		if matched, err := regexp.MatchString(pattern, str); err == nil && matched {
 			return true
 		}
 
 		// Try glob-like pattern (simple * wildcard)
 		if strings.Contains(pattern, "*") {
 			globPattern := strings.ReplaceAll(pattern, "*", ".*")
-			if matched, err := regexp.MatchString("^"+globPattern+"$", pkgPath); err == nil && matched {
+			if matched, err := regexp.MatchString("^"+globPattern+"$", str); err == nil && matched {
 				return true
 			}
 		}
@@ -225,37 +240,13 @@ func shouldExcludePackage(pkgPath string, config *Config) bool {
 	return false
 }
 
-// shouldExcludeFile checks if a file should be excluded based on patterns
-func shouldExcludeFile(filename string, config *Config) bool {
-	if config.ExcludeFiles == "" {
-		return false
-	}
-
-	patterns := strings.Split(config.ExcludeFiles, ",")
-	for _, pattern := range patterns {
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" {
-			continue
-		}
-
-		// Try exact match on basename
-		if strings.HasSuffix(filename, pattern) {
+// hasNonExcludedTestFiles checks if there are any test files that are not excluded
+func hasNonExcludedTestFiles(pass *analysis.Pass, config *Config) bool {
+	for _, file := range pass.Files {
+		filename := pass.Fset.Position(file.Pos()).Filename
+		if isTestFile(filename) && !shouldExcludeFile(filename, config) {
 			return true
 		}
-
-		// Try regex match on full path
-		if matched, err := regexp.MatchString(pattern, filename); err == nil && matched {
-			return true
-		}
-
-		// Try glob-like pattern (simple * wildcard)
-		if strings.Contains(pattern, "*") {
-			globPattern := strings.ReplaceAll(pattern, "*", ".*")
-			if matched, err := regexp.MatchString(globPattern, filename); err == nil && matched {
-				return true
-			}
-		}
 	}
-
 	return false
 }
