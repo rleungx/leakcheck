@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,9 +11,9 @@ import (
 )
 
 func main() {
-	// Check for help flag first
+	// Check for help and version flags first, before unitchecker processes them
 	for _, arg := range os.Args[1:] {
-		if arg == "-h" || arg == "--help" {
+		if arg == "-h" || arg == "--help" || arg == "help" {
 			showHelp()
 			return
 		}
@@ -24,19 +23,37 @@ func main() {
 		}
 	}
 
-	// Custom flags for leakcheck (avoid conflicts with unitchecker flags)
+	// Filter out our custom flags to avoid conflicts with unitchecker
 	var (
-		excludePackages = flag.String("exclude-packages", "", "comma-separated list of package patterns to exclude (supports regex)")
-		excludeFiles    = flag.String("exclude-files", "", "comma-separated list of file patterns to exclude (supports regex)")
+		excludePackages string
+		excludeFiles    string
+		filteredArgs    []string
 	)
 
-	// Parse flags without conflicting with unitchecker
-	flag.Parse()
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		if strings.HasPrefix(arg, "-exclude-packages=") {
+			excludePackages = strings.TrimPrefix(arg, "-exclude-packages=")
+		} else if arg == "-exclude-packages" && i+1 < len(os.Args) {
+			i++
+			excludePackages = os.Args[i]
+		} else if strings.HasPrefix(arg, "-exclude-files=") {
+			excludeFiles = strings.TrimPrefix(arg, "-exclude-files=")
+		} else if arg == "-exclude-files" && i+1 < len(os.Args) {
+			i++
+			excludeFiles = os.Args[i]
+		} else {
+			filteredArgs = append(filteredArgs, arg)
+		}
+	}
+
+	// Update os.Args to only include filtered arguments
+	os.Args = append([]string{os.Args[0]}, filteredArgs...)
 
 	// Create analyzer with configuration
 	config := &leakcheck.Config{
-		ExcludePackages: *excludePackages,
-		ExcludeFiles:    *excludeFiles,
+		ExcludePackages: excludePackages,
+		ExcludeFiles:    excludeFiles,
 	}
 	configuredAnalyzer := leakcheck.NewWithConfig(config)
 
