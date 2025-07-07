@@ -1,5 +1,9 @@
 # leakcheck - Goroutine Leak Detection Linter
 
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/rleungx/leakcheck/go.yml)
+![Codecov](https://img.shields.io/codecov/c/github/rleungx/leakcheck)
+![GitHub License](https://img.shields.io/github/license/rleungx/leakcheck)
+
 A static analysis tool that ensures all Go test functions are properly covered by [goleak](https://github.com/uber-go/goleak) for goroutine leak detection.
 
 ## Features

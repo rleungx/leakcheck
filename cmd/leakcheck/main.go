@@ -4,34 +4,54 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
+	"runtime"
 	"strings"
 
 	"github.com/rleungx/leakcheck"
-	"golang.org/x/tools/go/analysis/unitchecker"
+	"golang.org/x/tools/go/analysis/singlechecker"
+)
+
+// Version information, set at build time
+var (
+	version = "0.1.0"   // -ldflags "-X main.version=x.y.z"
+	commit  = "unknown" // -ldflags "-X main.commit=abc123"
+	date    = "unknown" // -ldflags "-X main.date=2025-01-01T00:00:00Z"
 )
 
 func main() {
-	// Check for help flag first
-	for _, arg := range os.Args[1:] {
-		if arg == "-h" || arg == "--help" {
-			showHelp()
-			return
-		}
-		if arg == "-V" || arg == "--version" {
-			fmt.Println(getVersion())
-			return
-		}
-	}
-
-	// Custom flags for leakcheck (avoid conflicts with unitchecker flags)
+	// Define flags
 	var (
 		excludePackages = flag.String("exclude-packages", "", "comma-separated list of package patterns to exclude (supports regex)")
 		excludeFiles    = flag.String("exclude-files", "", "comma-separated list of file patterns to exclude (supports regex)")
+		showHelp        = flag.Bool("h", false, "show help message")
+		showVersion     = flag.Bool("V", false, "show version information")
 	)
 
-	// Parse flags without conflicting with unitchecker
+	// Custom usage function
+	flag.Usage = func() {
+		showHelpMessage()
+	}
+
+	// Parse flags
 	flag.Parse()
+
+	// Handle help flag
+	if *showHelp {
+		showHelpMessage()
+		return
+	}
+
+	// Handle version flag
+	if *showVersion {
+		fmt.Println(getVersion())
+		return
+	}
+
+	// If no arguments provided after flags, show help
+	if flag.NArg() == 0 {
+		showHelpMessage()
+		return
+	}
 
 	// Create analyzer with configuration
 	config := &leakcheck.Config{
@@ -40,37 +60,35 @@ func main() {
 	}
 	configuredAnalyzer := leakcheck.NewWithConfig(config)
 
-	// Run the analyzer using unitchecker
-	unitchecker.Main(configuredAnalyzer)
+	// Prepare os.Args for singlechecker (remove our custom flags)
+	// Keep only the program name and the remaining arguments
+	newArgs := []string{os.Args[0]}
+	newArgs = append(newArgs, flag.Args()...)
+	os.Args = newArgs
+
+	// Run the analyzer using singlechecker
+	singlechecker.Main(configuredAnalyzer)
 }
 
-// getVersion returns the version string based on git information
+// getVersion returns the version string
 func getVersion() string {
-	// Try git describe first (tags or commit)
-	if version := getGitVersion("git", "describe", "--tags", "--exact-match", "HEAD"); version != "" {
-		return "leakcheck " + version
+	// Format: "leakcheck has version x.y.z built with goX.Y.Z from abc123 on 2025-01-01T00:00:00Z"
+	goVersion := strings.TrimPrefix(runtime.Version(), "go")
+
+	if version == "dev" && commit != "unknown" {
+		return fmt.Sprintf("leakcheck has version %s built with go%s from %s on %s",
+			version, goVersion, commit, date)
 	}
 
-	// Fallback to commit hash
-	if version := getGitVersion("git", "rev-parse", "--short", "HEAD"); version != "" {
-		return "leakcheck " + version
+	if version != "dev" {
+		return fmt.Sprintf("leakcheck has version %s built with go%s from %s on %s",
+			version, goVersion, commit, date)
 	}
 
-	// Final fallback
-	return "leakcheck v0.0.0-dev"
+	return fmt.Sprintf("leakcheck has version %s built with go%s", version, goVersion)
 }
 
-// getGitVersion executes git command and returns trimmed output
-func getGitVersion(name string, args ...string) string {
-	cmd := exec.Command(name, args...)
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(output))
-}
-
-func showHelp() {
+func showHelpMessage() {
 	fmt.Println(`leakcheck - Goroutine Leak Detection Linter
 
 A static analysis tool that ensures all Go test functions are properly covered by goleak
