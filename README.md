@@ -11,6 +11,8 @@ A static analysis tool that ensures all Go test functions are properly covered b
 - Detects missing `goleak` imports and `defer goleak.VerifyNone(t)` calls in test functions
 - Validates `TestMain(m *testing.M)` with `goleak.VerifyTestMain(m)` setup  
 - Supports package aliases and configurable exclusion patterns
+- Concurrent analysis with configurable performance settings
+- Regex and glob pattern matching for flexible exclusions
 
 ## Quick Start
 
@@ -19,10 +21,10 @@ A static analysis tool that ensures all Go test functions are properly covered b
 go install github.com/rleungx/leakcheck/cmd/leakcheck@latest
 
 # Usage
-leakcheck ./...                                    # Analyze all packages
-leakcheck -exclude-files="*mock*" ./...           # Exclude files
-leakcheck -exclude-packages="vendor" ./...        # Exclude packages
-leakcheck -h                                       # Show help
+leakcheck ./...                                          # Analyze all packages
+leakcheck -exclude-files="*mock*" ./...                  # Exclude files matching pattern
+leakcheck -exclude-packages="vendor,internal" ./...      # Exclude multiple packages
+leakcheck -concurrency=8 -timeout=10m ./...              # Custom performance settings
 ```
 
 ## Examples
@@ -62,6 +64,22 @@ func TestMain(m *testing.M) {
 func TestMain(m *testing.M) {
     goleak.VerifyTestMain(m)
 }
+```
+
+### Exclusion Examples
+
+```bash
+# Exclude specific files
+leakcheck -exclude-files="mock_test.go,generated_test.go" ./...
+
+# Exclude files with regex
+leakcheck -exclude-files=".*mock.*,.*_gen\.go$" ./...
+
+# Exclude multiple packages
+leakcheck -exclude-packages="vendor,internal,testdata" ./...
+
+# Exclude packages with regex  
+leakcheck -exclude-packages=".*test.*,vendor" ./...
 ```
 
 ## Development

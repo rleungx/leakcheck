@@ -77,6 +77,27 @@ func TestExcludeFilesRegex(t *testing.T) {
 	analysistest.Run(t, testdata, analyzer, "exclude_files")
 }
 
+func TestExcludeMultipleFiles(t *testing.T) {
+	config := &leakcheck.Config{
+		ExcludeFiles: "exclude_file_a_test.go,exclude_file_b_test.go",
+	}
+	analyzer := leakcheck.NewWithConfig(config)
+	testdata := analysistest.TestData()
+	// Should only report issues for normal_test.go
+	// exclude_file_a_test.go and exclude_file_b_test.go should be ignored
+	analysistest.Run(t, testdata, analyzer, "exclude_multiple_files")
+}
+
+func TestExcludeMultiplePackages(t *testing.T) {
+	config := &leakcheck.Config{
+		ExcludePackages: "exclude_package_a,exclude_package_b",
+	}
+	analyzer := leakcheck.NewWithConfig(config)
+	testdata := analysistest.TestData()
+	// Should not report any issues since both exclude_package_a and exclude_package_b are excluded
+	analysistest.Run(t, testdata, analyzer, "exclude_multiple_packages/exclude_package_a", "exclude_multiple_packages/exclude_package_b", "exclude_multiple_packages/normal_package")
+}
+
 func TestAlias(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(t, testdata, leakcheck.Analyzer, "alias")

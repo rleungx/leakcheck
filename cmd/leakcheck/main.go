@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/rleungx/leakcheck"
 	"golang.org/x/tools/go/analysis/singlechecker"
@@ -23,6 +24,8 @@ func main() {
 	var (
 		excludePackages = flag.String("exclude-packages", "", "comma-separated list of package patterns to exclude (supports regex)")
 		excludeFiles    = flag.String("exclude-files", "", "comma-separated list of file patterns to exclude (supports regex)")
+		concurrency     = flag.Int("concurrency", runtime.NumCPU(), "number of concurrent workers")
+		timeout         = flag.Duration("timeout", 30*time.Minute, "analysis timeout")
 		showHelp        = flag.Bool("h", false, "show help message")
 		showVersion     = flag.Bool("V", false, "show version information")
 	)
@@ -57,6 +60,8 @@ func main() {
 	config := &leakcheck.Config{
 		ExcludePackages: *excludePackages,
 		ExcludeFiles:    *excludeFiles,
+		Concurrency:     *concurrency,
+		Timeout:         *timeout,
 	}
 	configuredAnalyzer := leakcheck.NewWithConfig(config)
 
@@ -91,8 +96,8 @@ func getVersion() string {
 func showHelpMessage() {
 	fmt.Println(`leakcheck - Goroutine Leak Detection Linter
 
-A static analysis tool that ensures all Go test functions are properly covered by goleak
-for goroutine leak detection.
+A static analysis tool that ensures all Go test functions are properly covered 
+by goleak for goroutine leak detection.
 
 USAGE:
     leakcheck [flags] [packages]
@@ -102,14 +107,28 @@ FLAGS:
             Comma-separated list of package patterns to exclude (supports regex)
     -exclude-files string  
             Comma-separated list of file patterns to exclude (supports regex)
+    -concurrency int
+            Number of concurreny (default: number of CPUs)
+    -timeout duration
+            Analysis timeout (default: 30m0s)
     -h  Show this help message
     -V  Show version information
 
 EXAMPLES:
-    leakcheck ./...                                    # Analyze all packages
-    leakcheck ./pkg/server ./pkg/client               # Analyze specific packages
-    leakcheck -exclude-packages=".*_test" ./...       # Exclude test packages
-    leakcheck -exclude-files="*_mock_test.go" ./...   # Exclude mock test files
+    # Analyze all packages
+    leakcheck ./...
+    
+    # Analyze with custom concurrency
+    leakcheck -concurrency=8 -timeout=10m ./...
+    
+    # Analyze specific packages
+    leakcheck ./pkg/server ./pkg/client
+    
+    # Exclude patterns for large projects
+    leakcheck -exclude-packages=".*test.*" ./...
+    
+    # Quick analysis with timeout
+    leakcheck -timeout=5m ./pkg/executor
 
 For more information, visit: https://github.com/rleungx/leakcheck`)
 }
