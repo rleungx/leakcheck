@@ -22,10 +22,13 @@ test: test-deps
 test-coverage: test-deps
 	go test ./... -coverprofile=coverage.out
 
+bench:
+	go test -run '^$$' -bench '^BenchmarkAnalyzer$$' -benchmem .
+
 lint:
 	golangci-lint run ./...
 
 tidy:
 	go mod tidy
 
-.PHONY: all build tidy lint test-deps test test-coverage
+.PHONY: all build tidy lint test-deps test test-coverage bench

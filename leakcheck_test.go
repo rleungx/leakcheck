@@ -1,9 +1,18 @@
 package leakcheck_test
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/rleungx/leakcheck"
+	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
 )
 
@@ -106,4 +115,158 @@ func TestAlias(t *testing.T) {
 func TestAliasMain(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(t, testdata, leakcheck.Analyzer, "alias_main")
+}
+
+func TestNoImportIgnoresNonTestFiles(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, leakcheck.Analyzer, "no_import_non_test_file")
+}
+
+func TestNestedDeferDoesNotCountAsCoverage(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, leakcheck.Analyzer, "nested_defer")
+}
+
+func BenchmarkAnalyzer(b *testing.B) {
+	b.Run("NoImport", func(b *testing.B) {
+		analyzer := leakcheck.NewWithConfig(&leakcheck.Config{
+			ExcludePackages: "vendor,third_party",
+			ExcludeFiles:    "mock_*,zz_generated*.go,legacy_.*",
+			Concurrency:     8,
+		})
+		pass := mustBenchmarkPass(b, generateNoImportSources(48, 16))
+		verifyBenchmarkReports(b, analyzer.Run, pass, 48*16)
+		pass.Report = func(analysis.Diagnostic) {}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := analyzer.Run(pass); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("MixedCoverage", func(b *testing.B) {
+		analyzer := leakcheck.NewWithConfig(&leakcheck.Config{Concurrency: 8})
+		pass := mustBenchmarkPass(b, generateMixedCoverageSources(40, 18))
+		verifyBenchmarkReports(b, analyzer.Run, pass, 40*9)
+		pass.Report = func(analysis.Diagnostic) {}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := analyzer.Run(pass); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("ExcludedFiles", func(b *testing.B) {
+		analyzer := leakcheck.NewWithConfig(&leakcheck.Config{
+			ExcludeFiles: "mock_*,zz_generated*.go,legacy_.*",
+			Concurrency:  8,
+		})
+		pass := mustBenchmarkPass(b, generateExcludedFileSources(60, 12))
+		verifyBenchmarkReports(b, analyzer.Run, pass, 30*12)
+		pass.Report = func(analysis.Diagnostic) {}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if _, err := analyzer.Run(pass); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func mustBenchmarkPass(b *testing.B, sources map[string]string) *analysis.Pass {
+	b.Helper()
+
+	fset := token.NewFileSet()
+	files := make([]string, 0, len(sources))
+	for name := range sources {
+		files = append(files, name)
+	}
+	sort.Strings(files)
+
+	parsed := make([]*ast.File, 0, len(files))
+	for _, name := range files {
+		filename := filepath.Join("benchmark", name)
+		file, err := parser.ParseFile(fset, filename, sources[name], 0)
+		if err != nil {
+			b.Fatalf("parse %s: %v", name, err)
+		}
+		parsed = append(parsed, file)
+	}
+
+	return &analysis.Pass{
+		Fset:   fset,
+		Files:  parsed,
+		Pkg:    types.NewPackage("example.com/benchmark", "benchmark"),
+		Report: func(analysis.Diagnostic) {},
+	}
+}
+
+func verifyBenchmarkReports(b *testing.B, runner func(*analysis.Pass) (interface{}, error), pass *analysis.Pass, want int) {
+	b.Helper()
+
+	got := 0
+	pass.Report = func(analysis.Diagnostic) { got++ }
+	if _, err := runner(pass); err != nil {
+		b.Fatalf("warmup run failed: %v", err)
+	}
+	if got != want {
+		b.Fatalf("unexpected reports: got %d want %d", got, want)
+	}
+}
+
+func generateNoImportSources(fileCount, testsPerFile int) map[string]string {
+	sources := make(map[string]string, fileCount)
+	for fileIndex := 0; fileIndex < fileCount; fileIndex++ {
+		var sb strings.Builder
+		sb.WriteString("package benchmark\n\nimport \"testing\"\n\n")
+		for testIndex := 0; testIndex < testsPerFile; testIndex++ {
+			fmt.Fprintf(&sb, "func TestCase%d_%d(t *testing.T) {\n\t_ = t\n}\n\n", fileIndex, testIndex)
+		}
+		sources[fmt.Sprintf("case_%02d_test.go", fileIndex)] = sb.String()
+	}
+	return sources
+}
+
+func generateMixedCoverageSources(fileCount, testsPerFile int) map[string]string {
+	sources := make(map[string]string, fileCount)
+	for fileIndex := 0; fileIndex < fileCount; fileIndex++ {
+		var sb strings.Builder
+		sb.WriteString("package benchmark\n\nimport (\n\t\"testing\"\n\n\t\"go.uber.org/goleak\"\n)\n\n")
+		for testIndex := 0; testIndex < testsPerFile; testIndex++ {
+			fmt.Fprintf(&sb, "func TestCase%d_%d(t *testing.T) {\n", fileIndex, testIndex)
+			if testIndex%2 == 0 {
+				sb.WriteString("\tdefer goleak.VerifyNone(t)\n")
+			}
+			sb.WriteString("\t_ = goleak.IgnoreTopFunction\n")
+			sb.WriteString("}\n\n")
+		}
+		sources[fmt.Sprintf("mixed_%02d_test.go", fileIndex)] = sb.String()
+	}
+	return sources
+}
+
+func generateExcludedFileSources(fileCount, testsPerFile int) map[string]string {
+	sources := make(map[string]string, fileCount)
+	for fileIndex := 0; fileIndex < fileCount; fileIndex++ {
+		var sb strings.Builder
+		sb.WriteString("package benchmark\n\nimport \"testing\"\n\n")
+		for testIndex := 0; testIndex < testsPerFile; testIndex++ {
+			fmt.Fprintf(&sb, "func TestCase%d_%d(t *testing.T) {\n\t_ = t\n}\n\n", fileIndex, testIndex)
+		}
+
+		name := fmt.Sprintf("normal_%02d_test.go", fileIndex)
+		if fileIndex%2 == 0 {
+			name = fmt.Sprintf("mock_%02d_test.go", fileIndex)
+		}
+		sources[name] = sb.String()
+	}
+	return sources
 }

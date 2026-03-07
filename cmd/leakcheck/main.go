@@ -117,16 +117,16 @@ FLAGS:
 EXAMPLES:
     # Analyze all packages
     leakcheck ./...
-    
+
     # Analyze with custom concurrency
     leakcheck -concurrency=8 -timeout=10m ./...
-    
+
     # Analyze specific packages
     leakcheck ./pkg/server ./pkg/client
-    
+
     # Exclude patterns for large projects
     leakcheck -exclude-packages=".*test.*" ./...
-    
+
     # Quick analysis with timeout
     leakcheck -timeout=5m ./pkg/executor
 

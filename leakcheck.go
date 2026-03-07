@@ -9,10 +9,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
-	"golang.org/x/tools/go/ast/inspector"
 )
 
 // Config holds the configuration for the leakcheck analyzer
@@ -21,6 +21,13 @@ type Config struct {
 	ExcludeFiles    string
 	Concurrency     int
 	Timeout         time.Duration
+}
+
+type preparedConfig struct {
+	excludePackagePatterns []string
+	excludeFilePatterns    []string
+	concurrency            int
+	timeout                time.Duration
 }
 
 // regexCache caches compiled regular expressions for better performance
@@ -36,43 +43,53 @@ func New() *analysis.Analyzer {
 
 // NewWithConfig creates a new leakcheck analyzer with custom configuration
 func NewWithConfig(config *Config) *analysis.Analyzer {
-	// Ensure config is not nil and set defaults
-	if config == nil {
-		config = &Config{}
-	}
-
-	// Set reasonable defaults if not specified
-	if config.Concurrency <= 0 {
-		config.Concurrency = runtime.NumCPU()
-	}
-	if config.Timeout <= 0 {
-		config.Timeout = 30 * time.Minute // Default timeout
-	}
+	prepared := prepareConfig(config)
 
 	return &analysis.Analyzer{
-		Name:     "leakcheck",
-		Doc:      "check that all tests are covered by goleak",
-		Requires: []*analysis.Analyzer{inspect.Analyzer},
-		Run:      run(config),
+		Name: "leakcheck",
+		Doc:  "check that all tests are covered by goleak",
+		Run:  run(prepared),
 	}
 }
 
 // Analyzer is the default analyzer instance for backward compatibility
 var Analyzer = New()
 
+func prepareConfig(config *Config) preparedConfig {
+	if config == nil {
+		config = &Config{}
+	}
+
+	prepared := preparedConfig{
+		excludePackagePatterns: splitPatterns(config.ExcludePackages),
+		excludeFilePatterns:    splitPatterns(config.ExcludeFiles),
+		concurrency:            config.Concurrency,
+		timeout:                config.Timeout,
+	}
+
+	if prepared.concurrency <= 0 {
+		prepared.concurrency = runtime.NumCPU()
+	}
+	if prepared.timeout <= 0 {
+		prepared.timeout = 30 * time.Minute
+	}
+
+	return prepared
+}
+
 // run creates a run function with the given configuration
-func run(config *Config) func(*analysis.Pass) (interface{}, error) {
+func run(config preparedConfig) func(*analysis.Pass) (interface{}, error) {
 	return func(pass *analysis.Pass) (interface{}, error) {
 		// Create context with timeout if specified
 		ctx := context.Background()
-		if config.Timeout > 0 {
+		if config.timeout > 0 {
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, config.Timeout)
+			ctx, cancel = context.WithTimeout(ctx, config.timeout)
 			defer cancel()
 		}
 
 		// Use a channel to control concurrent processing
-		semaphore := make(chan struct{}, config.Concurrency)
+		semaphore := make(chan struct{}, config.concurrency)
 
 		// Early bailout checks for performance
 		if len(pass.Files) == 0 {
@@ -112,7 +129,7 @@ func run(config *Config) func(*analysis.Pass) (interface{}, error) {
 		}
 
 		// Analyze test functions with context and worker control
-		result, err := analyzeTestFunctionsWithContext(ctx, pass, goleakAlias, semaphore)
+		result, err := analyzeTestFunctionsWithContext(ctx, pass, goleakAlias, config, semaphore)
 		if err != nil {
 			return nil, err
 		}
@@ -131,7 +148,7 @@ func run(config *Config) func(*analysis.Pass) (interface{}, error) {
 			default:
 			}
 
-			if !result.funcsCoveredByDefer[testFunc.name] {
+			if !testFunc.covered {
 				reason := "missing defer goleak.VerifyNone(t)"
 				if result.hasTestMain && !result.hasVerifyTestMain {
 					reason = "TestMain exists but doesn't call goleak.VerifyTestMain"
@@ -149,10 +166,9 @@ func run(config *Config) func(*analysis.Pass) (interface{}, error) {
 
 // analysisResult holds the analysis results to avoid multiple traversals
 type analysisResult struct {
-	hasTestMain         bool
-	hasVerifyTestMain   bool
-	testFuncs           []testFuncInfo
-	funcsCoveredByDefer map[string]bool
+	hasTestMain       bool
+	hasVerifyTestMain bool
+	testFuncs         []testFuncInfo
 }
 
 // testFuncInfo holds information about a test function
@@ -160,18 +176,17 @@ type testFuncInfo struct {
 	name     string
 	pos      token.Pos
 	filename string
+	covered  bool
 }
 
 // analyzeTestFunctionsWithContext performs analysis with context and concurrency control
-func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, goleakAlias string, semaphore chan struct{}) (*analysisResult, error) {
+func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, goleakAlias string, config preparedConfig, semaphore chan struct{}) (*analysisResult, error) {
 	// For small number of files, use simple sequential processing
 	if len(pass.Files) <= 3 {
-		return analyzeTestFunctionsSequential(ctx, pass, goleakAlias)
+		return analyzeTestFunctionsSequential(ctx, pass, goleakAlias, config)
 	}
 
-	result := &analysisResult{
-		funcsCoveredByDefer: make(map[string]bool, 64), // Pre-allocate with reasonable capacity
-	}
+	result := &analysisResult{}
 
 	var mu sync.Mutex // Protect shared result data
 
@@ -210,7 +225,7 @@ func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, g
 				}
 
 				// Process this file
-				localResult := processFileForAnalysis(file, pass, goleakAlias)
+				localResult := processFileForAnalysis(file, pass, goleakAlias, config)
 
 				// Merge results with mutex protection
 				mu.Lock()
@@ -240,10 +255,8 @@ func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, g
 }
 
 // analyzeTestFunctionsSequential performs sequential analysis for small number of files
-func analyzeTestFunctionsSequential(ctx context.Context, pass *analysis.Pass, goleakAlias string) (*analysisResult, error) {
-	result := &analysisResult{
-		funcsCoveredByDefer: make(map[string]bool, 32),
-	}
+func analyzeTestFunctionsSequential(ctx context.Context, pass *analysis.Pass, goleakAlias string, config preparedConfig) (*analysisResult, error) {
+	result := &analysisResult{}
 
 	for _, file := range pass.Files {
 		select {
@@ -252,7 +265,7 @@ func analyzeTestFunctionsSequential(ctx context.Context, pass *analysis.Pass, go
 		default:
 		}
 
-		localResult := processFileForAnalysis(file, pass, goleakAlias)
+		localResult := processFileForAnalysis(file, pass, goleakAlias, config)
 		mergeResults(result, localResult)
 	}
 
@@ -268,72 +281,23 @@ func mergeResults(result, localResult *analysisResult) {
 		result.hasVerifyTestMain = true
 	}
 	result.testFuncs = append(result.testFuncs, localResult.testFuncs...)
-	for k, v := range localResult.funcsCoveredByDefer {
-		result.funcsCoveredByDefer[k] = v
-	}
 }
 
-// processFileForAnalysis processes a single file for test function analysis
-func processFileForAnalysis(file *ast.File, pass *analysis.Pass, goleakAlias string) *analysisResult {
-	// Early exit: check if this is a test file
-	filePos := pass.Fset.Position(file.Pos())
-	if !isTestFile(filePos.Filename) {
-		return &analysisResult{
-			funcsCoveredByDefer: make(map[string]bool, 0),
-		}
+// processFileForAnalysis processes a single file for test function analysis.
+func processFileForAnalysis(file *ast.File, pass *analysis.Pass, goleakAlias string, config preparedConfig) *analysisResult {
+	filename := pass.Fset.Position(file.Pos()).Filename
+	if !isTestFile(filename) || shouldExcludeFileWithConfig(filename, config) {
+		return emptyAnalysisResult()
 	}
 
-	result := &analysisResult{
-		funcsCoveredByDefer: make(map[string]bool, 8), // Pre-allocate with reasonable capacity
-	}
-
-	var currentTestFunc string
-	var inTestMain bool
-
-	// Walk through the AST of this specific file
-	ast.Inspect(file, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.FuncDecl:
-			if node.Name == nil {
-				return true
-			}
-			funcName := node.Name.Name
-			currentTestFunc = ""
-			inTestMain = false
-
-			if funcName == testMainFunc {
-				result.hasTestMain = true
-				inTestMain = true
-			} else if isTestFunction(funcName) {
-				currentTestFunc = funcName
-				testFunc := testFuncInfo{
-					name:     funcName,
-					pos:      node.Pos(),
-					filename: filePos.Filename,
-				}
-				result.testFuncs = append(result.testFuncs, testFunc)
-			}
-
-		case *ast.CallExpr:
-			if sel, ok := node.Fun.(*ast.SelectorExpr); ok {
-				if inTestMain && isGoleakCall(sel, verifyTestMain, goleakAlias) {
-					result.hasVerifyTestMain = true
-				}
-			}
-
-		case *ast.DeferStmt:
-			if currentTestFunc != "" {
-				if call, ok := node.Call.Fun.(*ast.SelectorExpr); ok {
-					if isGoleakCall(call, verifyNone, goleakAlias) {
-						result.funcsCoveredByDefer[currentTestFunc] = true
-					}
-				}
-			}
-		}
-		return true
-	})
-
+	result := &analysisResult{}
+	visitor := newFileAnalysisVisitor(result, filename, goleakAlias)
+	ast.Walk(&visitor.keep, file)
 	return result
+}
+
+func emptyAnalysisResult() *analysisResult {
+	return &analysisResult{}
 }
 
 // Constants for goleak package paths and method names
@@ -355,7 +319,21 @@ func isTestFile(filename string) bool {
 
 // isTestFunction checks if a function name is a test function
 func isTestFunction(name string) bool {
-	return strings.HasPrefix(name, testPrefix) && name != testMainFunc
+	if name == testMainFunc {
+		return false
+	}
+	return isGoTestName(name, testPrefix)
+}
+
+func isGoTestName(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	if len(name) == len(prefix) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(name[len(prefix):])
+	return !unicode.IsLower(r)
 }
 
 // isGoleakCall checks if a selector expression is a call to goleak with the specified method
@@ -392,15 +370,12 @@ func getGoleakAlias(files []*ast.File) string {
 }
 
 // shouldExcludePackage checks if a package should be excluded
-func shouldExcludePackage(pkgPath string, config *Config) bool {
-	if config.ExcludePackages == "" {
-		return false
-	}
-	return matchesAnyPattern(pkgPath, config.ExcludePackages)
+func shouldExcludePackage(pkgPath string, config preparedConfig) bool {
+	return matchesAnyPattern(pkgPath, config.excludePackagePatterns)
 }
 
 // shouldExcludeFileWithConfig checks if a file should be excluded
-func shouldExcludeFileWithConfig(filename string, config *Config) bool {
+func shouldExcludeFileWithConfig(filename string, config preparedConfig) bool {
 	// Extract just the filename without path for pattern matching
 	justFilename := filename
 	if lastSlash := strings.LastIndex(filename, "/"); lastSlash >= 0 {
@@ -410,30 +385,45 @@ func shouldExcludeFileWithConfig(filename string, config *Config) bool {
 		justFilename = justFilename[lastBackslash+1:]
 	}
 
-	// First check standard exclusions against both full path and filename
-	if config.ExcludeFiles != "" {
-		if matchesAnyPattern(filename, config.ExcludeFiles) || matchesAnyPattern(justFilename, config.ExcludeFiles) {
-			return true
-		}
-	}
-
-	return false
+	return matchesAnyPattern(filename, config.excludeFilePatterns) || matchesAnyPattern(justFilename, config.excludeFilePatterns)
 }
 
-// matchesAnyPattern checks if a string matches any of the comma-separated patterns
-func matchesAnyPattern(str, patterns string) bool {
+func splitPatterns(patterns string) []string {
 	if patterns == "" {
+		return nil
+	}
+
+	if !strings.Contains(patterns, ",") {
+		pattern := strings.TrimSpace(patterns)
+		if pattern == "" {
+			return nil
+		}
+		return []string{pattern}
+	}
+
+	parts := strings.Split(patterns, ",")
+	result := parts[:0]
+	for _, pattern := range parts {
+		pattern = strings.TrimSpace(pattern)
+		if pattern != "" {
+			result = append(result, pattern)
+		}
+	}
+	return result
+}
+
+// matchesAnyPattern checks if a string matches any prepared pattern.
+func matchesAnyPattern(str string, patterns []string) bool {
+	if len(patterns) == 0 {
 		return false
 	}
 
-	// Avoid creating string slice if only one pattern
-	if !strings.Contains(patterns, ",") {
-		return matchesPattern(str, strings.TrimSpace(patterns))
+	if len(patterns) == 1 {
+		return matchesPattern(str, patterns[0])
 	}
 
-	for _, pattern := range strings.Split(patterns, ",") {
-		pattern = strings.TrimSpace(pattern)
-		if pattern != "" && matchesPattern(str, pattern) {
+	for _, pattern := range patterns {
+		if matchesPattern(str, pattern) {
 			return true
 		}
 	}
@@ -557,7 +547,7 @@ func containsRegexMetachars(pattern string) bool {
 }
 
 // hasNonExcludedTestFiles checks if there are any test files that are not excluded
-func hasNonExcludedTestFiles(pass *analysis.Pass, config *Config) bool {
+func hasNonExcludedTestFiles(pass *analysis.Pass, config preparedConfig) bool {
 	for _, file := range pass.Files {
 		filename := pass.Fset.Position(file.Pos()).Filename
 		if isTestFile(filename) && !shouldExcludeFileWithConfig(filename, config) {
@@ -567,9 +557,8 @@ func hasNonExcludedTestFiles(pass *analysis.Pass, config *Config) bool {
 	return false
 }
 
-// reportUncoveredTestFunctionsWithContext reports all test functions that are not covered with context support
-func reportUncoveredTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, config *Config, reason string, semaphore chan struct{}) (interface{}, error) {
-	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+// reportUncoveredTestFunctionsWithContext reports all test functions that are not covered with context support.
+func reportUncoveredTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, config preparedConfig, reason string, semaphore chan struct{}) (interface{}, error) {
 
 	// Use semaphore to control concurrency
 	select {
@@ -579,22 +568,120 @@ func reportUncoveredTestFunctionsWithContext(ctx context.Context, pass *analysis
 		defer func() { <-semaphore }()
 	}
 
-	inspect.Preorder([]ast.Node{(*ast.FuncDecl)(nil)}, func(n ast.Node) {
-		// Check context periodically
+	for _, file := range pass.Files {
 		select {
 		case <-ctx.Done():
-			return
+			return nil, ctx.Err()
 		default:
 		}
 
-		fd := n.(*ast.FuncDecl)
-		if isTestFunction(fd.Name.Name) {
-			pos := pass.Fset.Position(fd.Pos())
-			if !shouldExcludeFileWithConfig(pos.Filename, config) {
-				pass.Reportf(fd.Pos(), "test function %s is not covered by goleak (%s)", fd.Name.Name, reason)
-			}
+		filename := pass.Fset.Position(file.Pos()).Filename
+		if !isTestFile(filename) || shouldExcludeFileWithConfig(filename, config) {
+			continue
 		}
-	})
+
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Name == nil || fd.Recv != nil || !isTestFunction(fd.Name.Name) {
+				continue
+			}
+			pass.Reportf(fd.Pos(), "test function %s is not covered by goleak (%s)", fd.Name.Name, reason)
+		}
+	}
 
 	return nil, nil
+}
+
+type fileAnalysisVisitor struct {
+	result      *analysisResult
+	filename    string
+	goleakAlias string
+	stack       []*funcContext
+	keep        visitorState
+	pop         visitorState
+}
+
+type visitorState struct {
+	owner *fileAnalysisVisitor
+	pop   bool
+}
+
+type funcContext struct {
+	isTestMain bool
+	testFunc   *testFuncInfo
+}
+
+func newFileAnalysisVisitor(result *analysisResult, filename, goleakAlias string) *fileAnalysisVisitor {
+	visitor := &fileAnalysisVisitor{
+		result:      result,
+		filename:    filename,
+		goleakAlias: goleakAlias,
+	}
+	visitor.keep.owner = visitor
+	visitor.pop.owner = visitor
+	visitor.pop.pop = true
+	return visitor
+}
+
+func (s *visitorState) Visit(n ast.Node) ast.Visitor {
+	return s.owner.visit(n, s.pop)
+}
+
+func (v *fileAnalysisVisitor) visit(n ast.Node, shouldPop bool) ast.Visitor {
+	if n == nil {
+		if shouldPop && len(v.stack) > 0 {
+			v.stack = v.stack[:len(v.stack)-1]
+		}
+		return nil
+	}
+
+	switch node := n.(type) {
+	case *ast.FuncLit:
+		return nil
+	case *ast.FuncDecl:
+		if node.Name == nil || node.Body == nil || node.Recv != nil {
+			return nil
+		}
+
+		funcName := node.Name.Name
+		switch {
+		case funcName == testMainFunc:
+			v.result.hasTestMain = true
+			v.stack = append(v.stack, &funcContext{isTestMain: true})
+			return &v.pop
+		case isTestFunction(funcName):
+			v.result.testFuncs = append(v.result.testFuncs, testFuncInfo{
+				name:     funcName,
+				pos:      node.Pos(),
+				filename: v.filename,
+			})
+			v.stack = append(v.stack, &funcContext{testFunc: &v.result.testFuncs[len(v.result.testFuncs)-1]})
+			return &v.pop
+		default:
+			return nil
+		}
+	case *ast.CallExpr:
+		ctx := v.current()
+		if ctx != nil && ctx.isTestMain {
+			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && isGoleakCall(sel, verifyTestMain, v.goleakAlias) {
+				v.result.hasVerifyTestMain = true
+			}
+		}
+	case *ast.DeferStmt:
+		ctx := v.current()
+		if ctx != nil && ctx.testFunc != nil {
+			if call, ok := node.Call.Fun.(*ast.SelectorExpr); ok && isGoleakCall(call, verifyNone, v.goleakAlias) {
+				ctx.testFunc.covered = true
+			}
+		}
+	}
+
+	return &v.keep
+}
+
+func (v *fileAnalysisVisitor) current() *funcContext {
+	if len(v.stack) == 0 {
+		return nil
+	}
+	return v.stack[len(v.stack)-1]
 }
