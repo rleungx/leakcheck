@@ -1,0 +1,6 @@
+version: "2"
+
+run:
+  relative-path-mode: gomod
+  modules-download-mode: readonly
+  timeout: 5m
