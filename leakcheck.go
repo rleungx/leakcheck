@@ -295,30 +295,25 @@ func processFileForAnalysis(file *ast.File, pass *analysis.Pass, config prepared
 	result := &analysisResult{}
 	imports := getGoleakImports(file)
 	includeTests := !shouldExcludeFileWithConfig(filename, config)
-	if !imports.imported {
-		return analyzeFileWithoutGoleakImport(file, filename, includeTests)
-	}
-
-	visitor := newFileAnalysisVisitor(result, pass, filename, imports, includeTests)
-	ast.Walk(&visitor.keep, file)
-	return result
-}
-
-func analyzeFileWithoutGoleakImport(file *ast.File, filename string, includeTests bool) *analysisResult {
-	result := &analysisResult{}
 	for _, decl := range file.Decls {
 		fd, ok := decl.(*ast.FuncDecl)
-		if !ok || fd.Name == nil || fd.Body == nil || fd.Recv != nil {
+		if !ok {
 			continue
 		}
-		switch {
-		case fd.Name.Name == testMainFunc:
+		switch classifyTestFunction(pass, fd) {
+		case suiteMain:
 			result.hasTestMain = true
-		case includeTests && isTestFunction(fd.Name.Name):
+			result.hasVerifyTestMain = imports.imported && hasGoleakCoverage(pass, fd, imports, true)
+		case ordinaryTest:
+			if !includeTests {
+				continue
+			}
 			result.testFuncs = append(result.testFuncs, testFuncInfo{
-				name:     fd.Name.Name,
-				pos:      fd.Pos(),
-				filename: filename,
+				name:            fd.Name.Name,
+				pos:             fd.Pos(),
+				filename:        filename,
+				hasGoleakImport: imports.imported,
+				covered:         imports.imported && hasGoleakCoverage(pass, fd, imports, false),
 			})
 		}
 	}
@@ -346,12 +341,67 @@ func isTestFile(filename string) bool {
 	return strings.HasSuffix(filename, testFileSuffix)
 }
 
-// isTestFunction checks if a function name is a test function
-func isTestFunction(name string) bool {
-	if name == testMainFunc {
-		return false
+type testFunctionKind uint8
+
+const (
+	notTest testFunctionKind = iota
+	ordinaryTest
+	suiteMain
+)
+
+// Go treats TestMain(*testing.T) as an ordinary test; only the *testing.M
+// signature defines the package entry point. Share this rule across fast paths.
+func classifyTestFunction(pass *analysis.Pass, fd *ast.FuncDecl) testFunctionKind {
+	if fd.Name == nil || fd.Body == nil || fd.Recv != nil || !isGoTestName(fd.Name.Name, testPrefix) {
+		return notTest
 	}
-	return isGoTestName(name, testPrefix)
+	param := testingParameter(pass, fd)
+	if param == "T" {
+		return ordinaryTest
+	}
+	if fd.Name.Name == testMainFunc && param == "M" {
+		return suiteMain
+	}
+	return notTest
+}
+
+func testingParameter(pass *analysis.Pass, fd *ast.FuncDecl) string {
+	if pass.TypesInfo != nil {
+		fn, ok := pass.TypesInfo.Defs[fd.Name].(*types.Func)
+		if !ok {
+			return ""
+		}
+		sig := fn.Type().(*types.Signature)
+		if sig.Params().Len() != 1 || sig.Results().Len() != 0 || sig.Variadic() || sig.TypeParams().Len() != 0 {
+			return ""
+		}
+		ptr, ok := types.Unalias(sig.Params().At(0).Type()).(*types.Pointer)
+		if !ok {
+			return ""
+		}
+		named, ok := types.Unalias(ptr.Elem()).(*types.Named)
+		if ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "testing" {
+			return named.Obj().Name()
+		}
+		return ""
+	}
+
+	// Synthetic Pass values (e.g. benchmarks) use the Go loader's syntax check.
+	if fd.Type.Params.NumFields() != 1 || fd.Type.Results.NumFields() != 0 || fd.Type.TypeParams.NumFields() != 0 {
+		return ""
+	}
+	ptr, ok := fd.Type.Params.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return ""
+	}
+	switch name := ptr.X.(type) {
+	case *ast.Ident:
+		return name.Name
+	case *ast.SelectorExpr:
+		return name.Sel.Name
+	default:
+		return ""
+	}
 }
 
 func isGoTestName(name, prefix string) bool {
@@ -408,6 +458,7 @@ func isImportedPath(actual, imported string) bool {
 // isGoleakCall checks the resolved function object rather than trusting the
 // spelling of a package alias, which may be different in each file or shadowed.
 func isGoleakCall(pass *analysis.Pass, fun ast.Expr, method string, imports goleakImports) bool {
+	fun = ast.Unparen(fun)
 	var ident *ast.Ident
 	switch expr := fun.(type) {
 	case *ast.SelectorExpr:
@@ -527,14 +578,27 @@ func matchesPattern(str, pattern string) bool {
 		return strings.Contains(str, pattern)
 	}
 
-	// Try glob semantics first. If the pattern was intended as a regular
-	// expression, a failed glob match falls through to the regex matcher.
-	if strings.Contains(pattern, "*") && matchGlobPattern(str, pattern) {
-		return true
+	// Choose a syntax once, independently of whether this string matches.
+	// A bare * identifies a glob, with dots kept literal. Patterns using only
+	// .* wildcards or other explicit regex syntax retain regex behavior.
+	if isGlobPattern(pattern) {
+		return matchGlobPattern(str, pattern)
 	}
 
 	// Try regex match with caching for complex patterns
 	return matchRegexPattern(str, pattern)
+}
+
+func isGlobPattern(pattern string) bool {
+	if strings.ContainsAny(pattern, `+?^${}()[]|\`) {
+		return false
+	}
+	for i := range len(pattern) {
+		if pattern[i] == '*' && (i == 0 || pattern[i-1] != '.') {
+			return true
+		}
+	}
+	return false
 }
 
 // matchGlobPattern handles simple glob patterns efficiently
@@ -643,110 +707,11 @@ func reportUncoveredTestFunctions(ctx context.Context, pass *analysis.Pass, conf
 		}
 		for _, decl := range file.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
-			if !ok || fd.Name == nil || fd.Body == nil || fd.Recv != nil || !isTestFunction(fd.Name.Name) {
+			if !ok || classifyTestFunction(pass, fd) != ordinaryTest {
 				continue
 			}
 			pass.Reportf(fd.Pos(), "test function %s is not covered by goleak (goleak not imported)", fd.Name.Name)
 		}
 	}
 	return nil, nil
-}
-
-type fileAnalysisVisitor struct {
-	result       *analysisResult
-	pass         *analysis.Pass
-	filename     string
-	imports      goleakImports
-	includeTests bool
-	stack        []*funcContext
-	keep         visitorState
-	pop          visitorState
-}
-
-type visitorState struct {
-	owner *fileAnalysisVisitor
-	pop   bool
-}
-
-type funcContext struct {
-	isTestMain bool
-	testFunc   *testFuncInfo
-}
-
-func newFileAnalysisVisitor(result *analysisResult, pass *analysis.Pass, filename string, imports goleakImports, includeTests bool) *fileAnalysisVisitor {
-	visitor := &fileAnalysisVisitor{
-		result:       result,
-		pass:         pass,
-		filename:     filename,
-		imports:      imports,
-		includeTests: includeTests,
-	}
-	visitor.keep.owner = visitor
-	visitor.pop.owner = visitor
-	visitor.pop.pop = true
-	return visitor
-}
-
-func (s *visitorState) Visit(n ast.Node) ast.Visitor {
-	return s.owner.visit(n, s.pop)
-}
-
-func (v *fileAnalysisVisitor) visit(n ast.Node, shouldPop bool) ast.Visitor {
-	if n == nil {
-		if shouldPop && len(v.stack) > 0 {
-			v.stack = v.stack[:len(v.stack)-1]
-		}
-		return nil
-	}
-
-	switch node := n.(type) {
-	case *ast.FuncLit:
-		return nil
-	case *ast.FuncDecl:
-		if node.Name == nil || node.Body == nil || node.Recv != nil {
-			return nil
-		}
-
-		funcName := node.Name.Name
-		switch {
-		case funcName == testMainFunc:
-			v.result.hasTestMain = true
-			v.stack = append(v.stack, &funcContext{isTestMain: true})
-			return &v.pop
-		case v.includeTests && isTestFunction(funcName):
-			v.result.testFuncs = append(v.result.testFuncs, testFuncInfo{
-				name:            funcName,
-				pos:             node.Pos(),
-				filename:        v.filename,
-				hasGoleakImport: v.imports.imported,
-			})
-			v.stack = append(v.stack, &funcContext{testFunc: &v.result.testFuncs[len(v.result.testFuncs)-1]})
-			return &v.pop
-		default:
-			return nil
-		}
-	case *ast.CallExpr:
-		ctx := v.current()
-		if ctx != nil && ctx.isTestMain {
-			if isGoleakCall(v.pass, node.Fun, verifyTestMain, v.imports) {
-				v.result.hasVerifyTestMain = true
-			}
-		}
-	case *ast.DeferStmt:
-		ctx := v.current()
-		if ctx != nil && ctx.testFunc != nil {
-			if isGoleakCall(v.pass, node.Call.Fun, verifyNone, v.imports) {
-				ctx.testFunc.covered = true
-			}
-		}
-	}
-
-	return &v.keep
-}
-
-func (v *fileAnalysisVisitor) current() *funcContext {
-	if len(v.stack) == 0 {
-		return nil
-	}
-	return v.stack[len(v.stack)-1]
 }

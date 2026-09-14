@@ -168,6 +168,30 @@ func TestDotImport(t *testing.T) {
 	analysistest.Run(t, testdata, leakcheck.Analyzer, "dot_import")
 }
 
+func TestGlobDoesNotFallBackToRegex(t *testing.T) {
+	testdata := analysistest.TestData()
+	for _, config := range []*leakcheck.Config{
+		{ExcludeFiles: "mock_*"},
+		{ExcludeFiles: "mock_*.go"},
+	} {
+		analysistest.Run(t, testdata, leakcheck.NewWithConfig(config), "glob_boundary")
+	}
+	analysistest.Run(t, testdata, leakcheck.NewWithConfig(&leakcheck.Config{
+		ExcludePackages: "mock_*",
+	}), "mock_package", "real_mock_package")
+}
+
+func TestOrdinaryTestMain(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), leakcheck.New(),
+		"ordinary_main_no_import", "ordinary_main_with_import", "ordinary_main_covered")
+}
+
+func TestControlFlowCoverage(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), leakcheck.New(), "control_flow",
+		"main_conditional", "main_dead", "main_early_return", "main_both_branches",
+		"main_deferred_exit", "main_goroutine", "main_deferred", "main_closure")
+}
+
 func BenchmarkAnalyzer(b *testing.B) {
 	b.Run("NoImport", func(b *testing.B) {
 		analyzer := leakcheck.NewWithConfig(&leakcheck.Config{

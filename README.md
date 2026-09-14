@@ -66,6 +66,34 @@ func TestMain(m *testing.M) {
 }
 ```
 
+`TestMain(t *testing.T)` is an ordinary test, not a package entry point, and
+requires its own `defer goleak.VerifyNone(t)` like any other test.
+
+### Coverage Paths
+
+Checks must cover every reachable exit path within the function. A check only
+inside a conditional branch, after an early return, or in unreachable code does
+not cover the function. Both branches may establish coverage separately:
+
+```go
+func TestBranches(t *testing.T) {
+    if useCustomOptions {
+        defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+    } else {
+        defer goleak.VerifyNone(t)
+    }
+    // test logic
+}
+```
+
+The analysis follows branches, loops, and explicit exits, including standard
+panic/Goexit/testing termination calls. `os.Exit` and `log.Fatal` bypass deferred
+checks. It does not follow helpers, closures, or goroutines to establish coverage,
+and assumes unknown calls return normally. Dynamic panics and correlations
+between nonconstant conditions are not modeled, so this is a conservative check
+of explicit control flow, not a proof that every runtime execution checks for
+leaks or is leak-free.
+
 ### Exclusion Examples
 
 ```bash
@@ -81,6 +109,16 @@ leakcheck -exclude-packages="vendor,internal,testdata" ./...
 # Exclude packages with regex
 leakcheck -exclude-packages=".*test.*,vendor" ./...
 ```
+
+Patterns are comma-separated. Plain words use substring matching. Patterns with
+a `*` not immediately preceded by `.` and no other regex operators
+(`+?^${}()[]|\`) are whole-string globs: `mock_*` matches
+`mock_helpers_test.go`, not `real_mock_test.go`; dots in `*_mock_test.go` and
+`*.*` are literal. Patterns whose wildcards are all `.*`, or which contain other
+regex operators, use regular expressions, such as `legacy_.*` or
+`^mock_.*\.go$`. A glob that does not match is never retried as a regex. File
+patterns are checked against both the full path and the basename; package
+patterns use the import path.
 
 ## Development
 

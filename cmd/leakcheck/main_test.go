@@ -59,18 +59,3 @@ func TestInjectedBuildMetadataTakesPrecedence(t *testing.T) {
 		}
 	}
 }
-
-func TestWantsHumanVersion(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	for _, args := range [][]string{{"-V"}, {"--version"}, {"./...", "-V"}} {
-		if !wantsHumanVersion(args) {
-			t.Fatalf("wantsHumanVersion(%q) = false, want true", args)
-		}
-	}
-	for _, args := range [][]string{nil, {"-V=full"}, {"--help"}} {
-		if wantsHumanVersion(args) {
-			t.Fatalf("wantsHumanVersion(%q) = true, want false", args)
-		}
-	}
-}

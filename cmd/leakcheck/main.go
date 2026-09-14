@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	"github.com/rleungx/leakcheck"
@@ -21,12 +25,8 @@ var (
 )
 
 func main() {
-	// Keep a convenient human-readable version flag while reserving -V=full
-	// for the analyzer protocol used by go vet.
-	if wantsHumanVersion(os.Args[1:]) {
-		fmt.Println(getVersion())
-		return
-	}
+	flag.Var(versionFlag{}, "V", "print version and exit (-V=full for go vet)")
+	flag.Var(versionFlag{}, "version", "print version and exit")
 
 	// singlechecker owns flag registration and parsing. In particular, this
 	// preserves -flags, -V=full, and the .cfg protocol required by go vet.
@@ -47,13 +47,49 @@ func getVersion() string {
 	return result
 }
 
-func wantsHumanVersion(args []string) bool {
-	for _, arg := range args {
-		if arg == "-V" || arg == "--version" {
-			return true
+// Let flag.Parse distinguish version flags from option values and positional
+// arguments. singlechecker preserves an existing -V flag registration.
+type versionFlag struct{}
+
+func (versionFlag) String() string   { return "false" }
+func (versionFlag) IsBoolFlag() bool { return true }
+
+func (versionFlag) Set(value string) error {
+	if value == "full" {
+		if err := printToolVersion(); err != nil {
+			return err
 		}
+	} else {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		if !enabled {
+			return nil
+		}
+		fmt.Println(getVersion())
 	}
-	return false
+	os.Exit(0)
+	return nil
+}
+
+// go vet uses this protocol to key its analysis cache by executable content.
+func printToolVersion() error {
+	path, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }() // Closing a read-only executable cannot lose data.
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
+		return err
+	}
+	_, err = fmt.Printf("%s version devel buildID=%x\n", path, hash.Sum(nil))
+	return err
 }
 
 func resolveBuildMetadata() (resolvedVersion, resolvedCommit, resolvedDate string) {
