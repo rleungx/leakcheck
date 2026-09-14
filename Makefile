@@ -1,7 +1,7 @@
 # Makefile for leakcheck
 
 # Version information  
-VERSION := $(shell if git describe --tags >/dev/null 2>&1; then git describe --tags | sed 's/^v//'; else echo "0.1.0"; fi)
+VERSION := $(shell if git describe --tags >/dev/null 2>&1; then git describe --tags | sed 's/^v//'; else echo "dev"; fi)
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
@@ -22,6 +22,10 @@ test: test-deps
 test-coverage: test-deps
 	go test ./... -coverprofile=coverage.out
 
+self-check: build
+	go vet -vettool=$(CURDIR)/bin/leakcheck ./...
+	./bin/leakcheck ./...
+
 bench:
 	go test -run '^$$' -bench '^BenchmarkAnalyzer$$' -benchmem .
 
@@ -31,4 +35,4 @@ lint:
 tidy:
 	go mod tidy
 
-.PHONY: all build tidy lint test-deps test test-coverage bench
+.PHONY: all build tidy lint test-deps test test-coverage self-check bench

@@ -97,6 +97,9 @@ make test
 # Run tests with coverage
 make test-coverage
 
+# Verify the analyzer against this repository and the go vet protocol
+make self-check
+
 # Run linter
 make lint
 

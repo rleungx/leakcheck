@@ -4,6 +4,7 @@ import (
 	"context"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"regexp"
 	"runtime"
 	"strings"
@@ -43,13 +44,21 @@ func New() *analysis.Analyzer {
 
 // NewWithConfig creates a new leakcheck analyzer with custom configuration
 func NewWithConfig(config *Config) *analysis.Analyzer {
-	prepared := prepareConfig(config)
+	effectiveConfig := &Config{}
+	if config != nil {
+		*effectiveConfig = *config
+	}
 
-	return &analysis.Analyzer{
+	analyzer := &analysis.Analyzer{
 		Name: "leakcheck",
 		Doc:  "check that all tests are covered by goleak",
-		Run:  run(prepared),
+		Run:  run(effectiveConfig),
 	}
+	analyzer.Flags.StringVar(&effectiveConfig.ExcludePackages, "exclude-packages", effectiveConfig.ExcludePackages, "comma-separated list of package patterns to exclude (supports regex and glob patterns)")
+	analyzer.Flags.StringVar(&effectiveConfig.ExcludeFiles, "exclude-files", effectiveConfig.ExcludeFiles, "comma-separated list of file patterns to exclude (supports regex and glob patterns)")
+	analyzer.Flags.IntVar(&effectiveConfig.Concurrency, "concurrency", effectiveConfig.Concurrency, "number of concurrent file workers (default: number of CPUs)")
+	analyzer.Flags.DurationVar(&effectiveConfig.Timeout, "timeout", effectiveConfig.Timeout, "per-package analysis timeout (default: 30m)")
+	return analyzer
 }
 
 // Analyzer is the default analyzer instance for backward compatibility
@@ -78,8 +87,10 @@ func prepareConfig(config *Config) preparedConfig {
 }
 
 // run creates a run function with the given configuration
-func run(config preparedConfig) func(*analysis.Pass) (interface{}, error) {
+func run(rawConfig *Config) func(*analysis.Pass) (interface{}, error) {
 	return func(pass *analysis.Pass) (interface{}, error) {
+		config := prepareConfig(rawConfig)
+
 		// Create context with timeout if specified
 		ctx := context.Background()
 		if config.timeout > 0 {
@@ -87,9 +98,6 @@ func run(config preparedConfig) func(*analysis.Pass) (interface{}, error) {
 			ctx, cancel = context.WithTimeout(ctx, config.timeout)
 			defer cancel()
 		}
-
-		// Use a channel to control concurrent processing
-		semaphore := make(chan struct{}, config.concurrency)
 
 		// Early bailout checks for performance
 		if len(pass.Files) == 0 {
@@ -113,23 +121,14 @@ func run(config preparedConfig) func(*analysis.Pass) (interface{}, error) {
 			return nil, nil
 		}
 
-		// Check if goleak is imported and get its alias
-		goleakAlias := getGoleakAlias(pass.Files)
-
-		// If no goleak import, report for all test functions
-		if goleakAlias == "" {
-			return reportUncoveredTestFunctionsWithContext(ctx, pass, config, "goleak not imported", semaphore)
-		}
-
-		// Check context again before expensive analysis
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		// Preserve the common no-import fast path while keeping import aliases
+		// file-scoped when at least one test file imports goleak.
+		if !hasAnyGoleakImport(pass.Files) {
+			return reportUncoveredTestFunctions(ctx, pass, config)
 		}
 
 		// Analyze test functions with context and worker control
-		result, err := analyzeTestFunctionsWithContext(ctx, pass, goleakAlias, config, semaphore)
+		result, err := analyzeTestFunctionsWithContext(ctx, pass, config)
 		if err != nil {
 			return nil, err
 		}
@@ -149,9 +148,11 @@ func run(config preparedConfig) func(*analysis.Pass) (interface{}, error) {
 			}
 
 			if !testFunc.covered {
-				reason := "missing defer goleak.VerifyNone(t)"
-				if result.hasTestMain && !result.hasVerifyTestMain {
+				reason := "goleak not imported"
+				if result.hasTestMain {
 					reason = "TestMain exists but doesn't call goleak.VerifyTestMain"
+				} else if testFunc.hasGoleakImport {
+					reason = "missing defer goleak.VerifyNone(t)"
 				}
 				// Report directly using cached position info
 				if !shouldExcludeFileWithConfig(testFunc.filename, config) {
@@ -173,17 +174,18 @@ type analysisResult struct {
 
 // testFuncInfo holds information about a test function
 type testFuncInfo struct {
-	name     string
-	pos      token.Pos
-	filename string
-	covered  bool
+	name            string
+	pos             token.Pos
+	filename        string
+	hasGoleakImport bool
+	covered         bool
 }
 
 // analyzeTestFunctionsWithContext performs analysis with context and concurrency control
-func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, goleakAlias string, config preparedConfig, semaphore chan struct{}) (*analysisResult, error) {
+func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, config preparedConfig) (*analysisResult, error) {
 	// For small number of files, use simple sequential processing
 	if len(pass.Files) <= 3 {
-		return analyzeTestFunctionsSequential(ctx, pass, goleakAlias, config)
+		return analyzeTestFunctionsSequential(ctx, pass, config)
 	}
 
 	result := &analysisResult{}
@@ -195,7 +197,7 @@ func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, g
 	errChan := make(chan error, 1)
 
 	// Determine optimal worker count based on file count
-	workerCount := cap(semaphore)
+	workerCount := config.concurrency
 	if len(pass.Files) < workerCount {
 		workerCount = len(pass.Files)
 	}
@@ -225,7 +227,7 @@ func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, g
 				}
 
 				// Process this file
-				localResult := processFileForAnalysis(file, pass, goleakAlias, config)
+				localResult := processFileForAnalysis(file, pass, config)
 
 				// Merge results with mutex protection
 				mu.Lock()
@@ -255,7 +257,7 @@ func analyzeTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, g
 }
 
 // analyzeTestFunctionsSequential performs sequential analysis for small number of files
-func analyzeTestFunctionsSequential(ctx context.Context, pass *analysis.Pass, goleakAlias string, config preparedConfig) (*analysisResult, error) {
+func analyzeTestFunctionsSequential(ctx context.Context, pass *analysis.Pass, config preparedConfig) (*analysisResult, error) {
 	result := &analysisResult{}
 
 	for _, file := range pass.Files {
@@ -265,7 +267,7 @@ func analyzeTestFunctionsSequential(ctx context.Context, pass *analysis.Pass, go
 		default:
 		}
 
-		localResult := processFileForAnalysis(file, pass, goleakAlias, config)
+		localResult := processFileForAnalysis(file, pass, config)
 		mergeResults(result, localResult)
 	}
 
@@ -284,15 +286,42 @@ func mergeResults(result, localResult *analysisResult) {
 }
 
 // processFileForAnalysis processes a single file for test function analysis.
-func processFileForAnalysis(file *ast.File, pass *analysis.Pass, goleakAlias string, config preparedConfig) *analysisResult {
+func processFileForAnalysis(file *ast.File, pass *analysis.Pass, config preparedConfig) *analysisResult {
 	filename := pass.Fset.Position(file.Pos()).Filename
-	if !isTestFile(filename) || shouldExcludeFileWithConfig(filename, config) {
+	if !isTestFile(filename) {
 		return emptyAnalysisResult()
 	}
 
 	result := &analysisResult{}
-	visitor := newFileAnalysisVisitor(result, filename, goleakAlias)
+	imports := getGoleakImports(file)
+	includeTests := !shouldExcludeFileWithConfig(filename, config)
+	if !imports.imported {
+		return analyzeFileWithoutGoleakImport(file, filename, includeTests)
+	}
+
+	visitor := newFileAnalysisVisitor(result, pass, filename, imports, includeTests)
 	ast.Walk(&visitor.keep, file)
+	return result
+}
+
+func analyzeFileWithoutGoleakImport(file *ast.File, filename string, includeTests bool) *analysisResult {
+	result := &analysisResult{}
+	for _, decl := range file.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Name == nil || fd.Body == nil || fd.Recv != nil {
+			continue
+		}
+		switch {
+		case fd.Name.Name == testMainFunc:
+			result.hasTestMain = true
+		case includeTests && isTestFunction(fd.Name.Name):
+			result.testFuncs = append(result.testFuncs, testFuncInfo{
+				name:     fd.Name.Name,
+				pos:      fd.Pos(),
+				filename: filename,
+			})
+		}
+	}
 	return result
 }
 
@@ -302,8 +331,8 @@ func emptyAnalysisResult() *analysisResult {
 
 // Constants for goleak package paths and method names
 const (
-	goleakUberPath   = `"go.uber.org/goleak"`
-	goleakGithubPath = `"github.com/uber-go/goleak"`
+	goleakUberPath   = "go.uber.org/goleak"
+	goleakGithubPath = "github.com/uber-go/goleak"
 	defaultAlias     = "goleak"
 	verifyTestMain   = "VerifyTestMain"
 	verifyNone       = "VerifyNone"
@@ -336,37 +365,82 @@ func isGoTestName(name, prefix string) bool {
 	return !unicode.IsLower(r)
 }
 
-// isGoleakCall checks if a selector expression is a call to goleak with the specified method
-func isGoleakCall(sel *ast.SelectorExpr, method, alias string) bool {
-	if sel.Sel.Name != method {
-		return false
-	}
-
-	if ident, ok := sel.X.(*ast.Ident); ok {
-		return ident.Name == alias
-	}
-
-	return false
+type goleakImports struct {
+	names    map[string]struct{}
+	dot      bool
+	imported bool
 }
 
-// getGoleakAlias checks if any file imports goleak and returns its alias/name
-func getGoleakAlias(files []*ast.File) string {
-	for _, file := range files {
-		// Early exit if no imports
-		if len(file.Imports) == 0 {
+func getGoleakImports(file *ast.File) goleakImports {
+	imports := goleakImports{}
+	for _, imp := range file.Imports {
+		if imp.Path == nil || !isGoleakPath(strings.Trim(imp.Path.Value, `"`)) {
 			continue
 		}
 
-		for _, imp := range file.Imports {
-			if imp.Path != nil && (imp.Path.Value == goleakUberPath || imp.Path.Value == goleakGithubPath) {
-				if imp.Name != nil {
-					return imp.Name.Name
-				}
-				return defaultAlias
+		imports.imported = true
+		name := defaultAlias
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		switch name {
+		case ".":
+			imports.dot = true
+		case "_":
+		default:
+			if imports.names == nil {
+				imports.names = make(map[string]struct{}, 1)
 			}
+			imports.names[name] = struct{}{}
 		}
 	}
-	return ""
+	return imports
+}
+
+func isGoleakPath(path string) bool {
+	return isImportedPath(path, goleakUberPath) || isImportedPath(path, goleakGithubPath)
+}
+
+func isImportedPath(actual, imported string) bool {
+	return actual == imported || actual == "vendor/"+imported || strings.HasSuffix(actual, "/vendor/"+imported)
+}
+
+// isGoleakCall checks the resolved function object rather than trusting the
+// spelling of a package alias, which may be different in each file or shadowed.
+func isGoleakCall(pass *analysis.Pass, fun ast.Expr, method string, imports goleakImports) bool {
+	var ident *ast.Ident
+	switch expr := fun.(type) {
+	case *ast.SelectorExpr:
+		ident = expr.Sel
+	case *ast.Ident:
+		ident = expr
+	default:
+		return false
+	}
+
+	if ident.Name != method {
+		return false
+	}
+	if pass.TypesInfo != nil {
+		fn, ok := pass.TypesInfo.Uses[ident].(*types.Func)
+		return ok && fn.Pkg() != nil && isGoleakPath(fn.Pkg().Path())
+	}
+
+	// A small fallback keeps direct Analyzer.Run users and benchmarks working
+	// even if they construct a Pass without type information.
+	switch expr := fun.(type) {
+	case *ast.SelectorExpr:
+		pkg, ok := expr.X.(*ast.Ident)
+		if !ok {
+			return false
+		}
+		_, ok = imports.names[pkg.Name]
+		return ok
+	case *ast.Ident:
+		return imports.dot
+	default:
+		return false
+	}
 }
 
 // shouldExcludePackage checks if a package should be excluded
@@ -453,9 +527,10 @@ func matchesPattern(str, pattern string) bool {
 		return strings.Contains(str, pattern)
 	}
 
-	// Handle simple glob patterns (only convert if it looks like a simple glob)
-	if strings.Contains(pattern, "*") && !containsRegexMetachars(pattern) {
-		return matchGlobPattern(str, pattern)
+	// Try glob semantics first. If the pattern was intended as a regular
+	// expression, a failed glob match falls through to the regex matcher.
+	if strings.Contains(pattern, "*") && matchGlobPattern(str, pattern) {
+		return true
 	}
 
 	// Try regex match with caching for complex patterns
@@ -534,18 +609,6 @@ func containsSpecialChars(pattern string) bool {
 	return strings.ContainsAny(pattern, ".*+?^${}()[]|\\")
 }
 
-// containsRegexMetachars checks if pattern contains regex metacharacters other than *
-func containsRegexMetachars(pattern string) bool {
-	// Use faster byte-based check with optimized switch
-	for _, r := range pattern {
-		switch r {
-		case '.', '^', '$', '+', '?', '[', ']', '(', ')', '{', '}', '|', '\\':
-			return true
-		}
-	}
-	return false
-}
-
 // hasNonExcludedTestFiles checks if there are any test files that are not excluded
 func hasNonExcludedTestFiles(pass *analysis.Pass, config preparedConfig) bool {
 	for _, file := range pass.Files {
@@ -557,17 +620,16 @@ func hasNonExcludedTestFiles(pass *analysis.Pass, config preparedConfig) bool {
 	return false
 }
 
-// reportUncoveredTestFunctionsWithContext reports all test functions that are not covered with context support.
-func reportUncoveredTestFunctionsWithContext(ctx context.Context, pass *analysis.Pass, config preparedConfig, reason string, semaphore chan struct{}) (interface{}, error) {
-
-	// Use semaphore to control concurrency
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case semaphore <- struct{}{}:
-		defer func() { <-semaphore }()
+func hasAnyGoleakImport(files []*ast.File) bool {
+	for _, file := range files {
+		if getGoleakImports(file).imported {
+			return true
+		}
 	}
+	return false
+}
 
+func reportUncoveredTestFunctions(ctx context.Context, pass *analysis.Pass, config preparedConfig) (interface{}, error) {
 	for _, file := range pass.Files {
 		select {
 		case <-ctx.Done():
@@ -579,26 +641,26 @@ func reportUncoveredTestFunctionsWithContext(ctx context.Context, pass *analysis
 		if !isTestFile(filename) || shouldExcludeFileWithConfig(filename, config) {
 			continue
 		}
-
 		for _, decl := range file.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
-			if !ok || fd.Name == nil || fd.Recv != nil || !isTestFunction(fd.Name.Name) {
+			if !ok || fd.Name == nil || fd.Body == nil || fd.Recv != nil || !isTestFunction(fd.Name.Name) {
 				continue
 			}
-			pass.Reportf(fd.Pos(), "test function %s is not covered by goleak (%s)", fd.Name.Name, reason)
+			pass.Reportf(fd.Pos(), "test function %s is not covered by goleak (goleak not imported)", fd.Name.Name)
 		}
 	}
-
 	return nil, nil
 }
 
 type fileAnalysisVisitor struct {
-	result      *analysisResult
-	filename    string
-	goleakAlias string
-	stack       []*funcContext
-	keep        visitorState
-	pop         visitorState
+	result       *analysisResult
+	pass         *analysis.Pass
+	filename     string
+	imports      goleakImports
+	includeTests bool
+	stack        []*funcContext
+	keep         visitorState
+	pop          visitorState
 }
 
 type visitorState struct {
@@ -611,11 +673,13 @@ type funcContext struct {
 	testFunc   *testFuncInfo
 }
 
-func newFileAnalysisVisitor(result *analysisResult, filename, goleakAlias string) *fileAnalysisVisitor {
+func newFileAnalysisVisitor(result *analysisResult, pass *analysis.Pass, filename string, imports goleakImports, includeTests bool) *fileAnalysisVisitor {
 	visitor := &fileAnalysisVisitor{
-		result:      result,
-		filename:    filename,
-		goleakAlias: goleakAlias,
+		result:       result,
+		pass:         pass,
+		filename:     filename,
+		imports:      imports,
+		includeTests: includeTests,
 	}
 	visitor.keep.owner = visitor
 	visitor.pop.owner = visitor
@@ -649,11 +713,12 @@ func (v *fileAnalysisVisitor) visit(n ast.Node, shouldPop bool) ast.Visitor {
 			v.result.hasTestMain = true
 			v.stack = append(v.stack, &funcContext{isTestMain: true})
 			return &v.pop
-		case isTestFunction(funcName):
+		case v.includeTests && isTestFunction(funcName):
 			v.result.testFuncs = append(v.result.testFuncs, testFuncInfo{
-				name:     funcName,
-				pos:      node.Pos(),
-				filename: v.filename,
+				name:            funcName,
+				pos:             node.Pos(),
+				filename:        v.filename,
+				hasGoleakImport: v.imports.imported,
 			})
 			v.stack = append(v.stack, &funcContext{testFunc: &v.result.testFuncs[len(v.result.testFuncs)-1]})
 			return &v.pop
@@ -663,14 +728,14 @@ func (v *fileAnalysisVisitor) visit(n ast.Node, shouldPop bool) ast.Visitor {
 	case *ast.CallExpr:
 		ctx := v.current()
 		if ctx != nil && ctx.isTestMain {
-			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && isGoleakCall(sel, verifyTestMain, v.goleakAlias) {
+			if isGoleakCall(v.pass, node.Fun, verifyTestMain, v.imports) {
 				v.result.hasVerifyTestMain = true
 			}
 		}
 	case *ast.DeferStmt:
 		ctx := v.current()
 		if ctx != nil && ctx.testFunc != nil {
-			if call, ok := node.Call.Fun.(*ast.SelectorExpr); ok && isGoleakCall(call, verifyNone, v.goleakAlias) {
+			if isGoleakCall(v.pass, node.Call.Fun, verifyNone, v.imports) {
 				ctx.testFunc.covered = true
 			}
 		}

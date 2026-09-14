@@ -12,9 +12,14 @@ import (
 	"testing"
 
 	"github.com/rleungx/leakcheck"
+	"go.uber.org/goleak"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func TestBasic(t *testing.T) {
 	testdata := analysistest.TestData()
@@ -125,6 +130,42 @@ func TestNoImportIgnoresNonTestFiles(t *testing.T) {
 func TestNestedDeferDoesNotCountAsCoverage(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(t, testdata, leakcheck.Analyzer, "nested_defer")
+}
+
+func TestMultipleAliases(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, leakcheck.Analyzer, "multiple_aliases")
+}
+
+func TestExcludedTestMainStillCoversPackage(t *testing.T) {
+	analyzer := leakcheck.NewWithConfig(&leakcheck.Config{ExcludeFiles: "main_test.go"})
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, analyzer, "excluded_testmain")
+}
+
+func TestShadowedAliasDoesNotCountAsCoverage(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, leakcheck.Analyzer, "shadowed_alias")
+}
+
+func TestGlobExclusionWithDot(t *testing.T) {
+	analyzer := leakcheck.NewWithConfig(&leakcheck.Config{ExcludeFiles: "*_mock_test.go"})
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, analyzer, "glob_exclude")
+}
+
+func TestAnalyzerFlagsConfigureExclusions(t *testing.T) {
+	analyzer := leakcheck.New()
+	if err := analyzer.Flags.Set("exclude-files", "*_mock_test.go"); err != nil {
+		t.Fatal(err)
+	}
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, analyzer, "glob_exclude")
+}
+
+func TestDotImport(t *testing.T) {
+	testdata := analysistest.TestData()
+	analysistest.Run(t, testdata, leakcheck.Analyzer, "dot_import")
 }
 
 func BenchmarkAnalyzer(b *testing.B) {

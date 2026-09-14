@@ -51,6 +51,9 @@ jobs:
       - name: Run tests and collect coverage
         run: make test-coverage
 
+      - name: Run leakcheck self-check
+        run: make self-check
+
       - name: Upload coverage results to Codecov
         uses: codecov/codecov-action@v5
         with:
