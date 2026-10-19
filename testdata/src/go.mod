@@ -1,7 +1,5 @@
 module src
 
-go 1.27
-
-toolchain go1.27.2
+go 1.26.0
 
 require go.uber.org/goleak v1.3.0

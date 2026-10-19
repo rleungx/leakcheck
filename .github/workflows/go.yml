@@ -9,6 +9,16 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Go-version policy: stay decoupled from any specific Go toolchain.
+#   - go.mod carries a *minimum* language version (`go 1.26.0`), never a `toolchain`
+#     pin. `setup-go` with `go-version-file` resolves that to the newest Go that
+#     satisfies the floor, so the build tracks the current toolchain instead of a
+#     locked point release.
+#   - golangci-lint is installed *from source* (`go install`), which compiles it
+#     against the active toolchain. A prebuilt golangci-lint binary has a baked-in
+#     "max Go version it can target"; installing from source removes that ceiling,
+#     so the linter can never be older than the toolchain it runs on again.
+
 jobs:
   lint:
     name: Lint
@@ -22,10 +32,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install golangci-lint (source build, matches active toolchain)
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.10.1
+        run: golangci-lint run ./...
 
   test:
     name: Test and collect coverage
